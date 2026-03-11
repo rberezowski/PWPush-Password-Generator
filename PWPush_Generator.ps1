@@ -1,564 +1,704 @@
-<#
-    .SYNOPSIS
-    PWPush.com password generator / custom password pusher GUI.
-
-    .NOTES
-    - If Custom Password is entered, that exact value is used.
-    - If Custom Password is blank, Generate creates a random password using Length + selected options.
-    - Push sends the currently displayed password to PWPush.
-    - Timer/reset only applies to Push.
-    - No hashing is performed on your custom password.
-    - Days slider max is 14.
-    - Views slider max is 10.
-#>
-
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# -----------------------------
-# Functions
-# -----------------------------
+[System.Windows.Forms.Application]::EnableVisualStyles()
 
-function New-RandomPassword {
+# ============================================================
+# PWPush GUI
+# Version : 1.7
+# Purpose : Generate or enter a password, optionally add
+#           multiline extra information, push it to PWPush,
+#           and optionally open a new email with the PWPush URL.
+#
+# Notes:
+# - Default PWPush URL = https://pwpush.mget.ca
+# - Startup cursor lands in Recipient Email
+# - Max Days  = 14
+# - Max Views = 10
+# - "Generate" only generates a password
+# - "Push" pushes:
+#       Password: <password>
+#       <optional extra lines>
+# - "Email PWPush URL" opens the default mail client with the
+#   generated PWPush URL in the message body
+# ============================================================
+
+# ------------------------------------------------------------
+# Script-scope storage
+# ------------------------------------------------------------
+$script:LastPushUrl = ""
+$script:PushCooldownSeconds = 5
+$script:PushTimer = $null
+$script:PushTimerRemaining = 0
+
+# ------------------------------------------------------------
+# Helper: Status / Log
+# ------------------------------------------------------------
+function Set-Status {
     param(
-        [Parameter(Mandatory = $true)]
-        [ValidateRange(1, [int]::MaxValue)]
-        [int]$PasswordLength,
-
-        [Parameter(Mandatory = $true)]
-        [bool]$UseLetters,
-
-        [Parameter(Mandatory = $true)]
-        [bool]$UseNumbers,
-
-        [Parameter(Mandatory = $true)]
-        [bool]$UseUppercase,
-
-        [Parameter(Mandatory = $true)]
-        [bool]$UseSpecial
+        [string]$Message,
+        [System.Drawing.Color]$Color = [System.Drawing.Color]::Black
     )
 
-    $validCharacters = New-Object System.Collections.Generic.List[char]
+    $lblStatus.Text = $Message
+    $lblStatus.ForeColor = $Color
+}
+
+function Write-Log {
+    param(
+        [string]$Message
+    )
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $txtLog.AppendText("[$timestamp] $Message`r`n")
+}
+
+# ------------------------------------------------------------
+# Helper: Password Generator
+# ------------------------------------------------------------
+function Generate-RandomPassword {
+    param(
+        [int]$Length = 20,
+        [bool]$UseLetters = $true,
+        [bool]$UseNumbers = $true,
+        [bool]$UseUppercase = $true,
+        [bool]$UseSpecial = $true
+    )
+
+    $lowerChars   = "abcdefghijklmnopqrstuvwxyz"
+    $upperChars   = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    $numberChars  = "0123456789"
+    $specialChars = "!@#$%^&*()-_=+[]{};:,.?/"
+
+    $charPool = ""
+    $required = New-Object System.Collections.Generic.List[char]
 
     if ($UseLetters) {
-        97..122 | ForEach-Object { [void]$validCharacters.Add([char]$_) }
-        if ($UseUppercase) {
-            65..90 | ForEach-Object { [void]$validCharacters.Add([char]$_) }
-        }
+        $charPool += $lowerChars
+        $required.Add(($lowerChars.ToCharArray() | Get-Random))
+    }
+
+    if ($UseUppercase) {
+        $charPool += $upperChars
+        $required.Add(($upperChars.ToCharArray() | Get-Random))
     }
 
     if ($UseNumbers) {
-        48..57 | ForEach-Object { [void]$validCharacters.Add([char]$_) }
+        $charPool += $numberChars
+        $required.Add(($numberChars.ToCharArray() | Get-Random))
     }
 
     if ($UseSpecial) {
-        @('!', '@', '#', '%', '^', '&', '*') | ForEach-Object {
-            [void]$validCharacters.Add([char]$_)
+        $charPool += $specialChars
+        $required.Add(($specialChars.ToCharArray() | Get-Random))
+    }
+
+    if ([string]::IsNullOrWhiteSpace($charPool)) {
+        throw "Select at least one character type for password generation."
+    }
+
+    if ($Length -lt $required.Count) {
+        $Length = $required.Count
+    }
+
+    $passwordChars = New-Object System.Collections.Generic.List[char]
+
+    foreach ($char in $required) {
+        $passwordChars.Add($char)
+    }
+
+    $poolArray = $charPool.ToCharArray()
+
+    for ($i = $passwordChars.Count; $i -lt $Length; $i++) {
+        $passwordChars.Add(($poolArray | Get-Random))
+    }
+
+    $shuffled = $passwordChars | Sort-Object { Get-Random }
+    return (-join $shuffled)
+}
+
+# ------------------------------------------------------------
+# Helper: Extract PWPush URL from response
+# ------------------------------------------------------------
+function Get-PWPushUrlFromResponse {
+    param(
+        [object]$Response,
+        [string]$BaseUrl
+    )
+
+    if ($null -eq $Response) {
+        return $null
+    }
+
+    $possibleProps = @(
+        "html_url",
+        "htmlUrl",
+        "url",
+        "direct_url",
+        "link"
+    )
+
+    foreach ($prop in $possibleProps) {
+        if ($Response.PSObject.Properties.Name -contains $prop) {
+            $value = $Response.$prop
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                return $value
+            }
         }
     }
 
-    if ($validCharacters.Count -eq 0) {
-        throw "Select at least one random password option: Letters, Numbers, or Special Characters."
+    $tokenProps = @("url_token", "token", "id")
+    foreach ($prop in $tokenProps) {
+        if ($Response.PSObject.Properties.Name -contains $prop) {
+            $token = $Response.$prop
+            if (-not [string]::IsNullOrWhiteSpace($token)) {
+                return ($BaseUrl.TrimEnd("/") + "/p/" + $token)
+            }
+        }
     }
 
-    return (1..$PasswordLength | ForEach-Object {
-        Get-Random -InputObject $validCharacters
-    }) -join ''
+    if ($Response.PSObject.Properties.Name -contains "password") {
+        $pwObj = $Response.password
+
+        foreach ($prop in $possibleProps) {
+            if ($pwObj.PSObject.Properties.Name -contains $prop) {
+                $value = $pwObj.$prop
+                if (-not [string]::IsNullOrWhiteSpace($value)) {
+                    return $value
+                }
+            }
+        }
+
+        foreach ($prop in $tokenProps) {
+            if ($pwObj.PSObject.Properties.Name -contains $prop) {
+                $token = $pwObj.$prop
+                if (-not [string]::IsNullOrWhiteSpace($token)) {
+                    return ($BaseUrl.TrimEnd("/") + "/p/" + $token)
+                }
+            }
+        }
+    }
+
+    return $null
 }
 
-function ConvertFrom-SecurePassword {
-    param (
-        [Parameter(Position = 0, Mandatory = $true, ValueFromPipeline = $true)]
-        [SecureString]$Password
+# ------------------------------------------------------------
+# Helper: Push password to PWPush
+# ------------------------------------------------------------
+function Push-PWPush {
+    param(
+        [string]$BaseUrl,
+        [string]$Password,
+        [int]$ExpireDays,
+        [int]$ExpireViews
     )
 
-    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+    if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
+        throw "PWPush URL is required."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Password)) {
+        throw "Generate or enter a password first before pushing."
+    }
+
+    if ($ExpireDays -lt 1)  { $ExpireDays = 1 }
+    if ($ExpireDays -gt 14) { $ExpireDays = 14 }
+
+    if ($ExpireViews -lt 1)  { $ExpireViews = 1 }
+    if ($ExpireViews -gt 10) { $ExpireViews = 10 }
+
+    $base = $BaseUrl.TrimEnd('/')
+    $apiUrl = "$base/p.json"
+
+    $body = @{
+        "password[payload]"            = $Password
+        "password[expire_after_days]"  = $ExpireDays
+        "password[expire_after_views]" = $ExpireViews
+    }
+
     try {
-        return [System.Runtime.InteropServices.Marshal]::PtrToStringUni($bstr)
-    }
-    finally {
-        if ($bstr -ne [IntPtr]::Zero) {
-            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        $response = Invoke-RestMethod -Uri $apiUrl -Method Post -Body $body -ContentType "application/x-www-form-urlencoded" -ErrorAction Stop
+        $pushUrl = Get-PWPushUrlFromResponse -Response $response -BaseUrl $base
+
+        if ([string]::IsNullOrWhiteSpace($pushUrl)) {
+            throw "PWPush accepted the request but no usable URL was returned."
         }
+
+        return $pushUrl
+    }
+    catch {
+        throw $_.Exception.Message
     }
 }
 
-function Publish-Password {
-    param (
-        [Parameter(Position = 0, Mandatory = $true, ValueFromPipeline = $true)]
-        [Alias("p")]
-        [SecureString]$Password,
-
-        [Alias("d")]
-        [int]$Days = 7,
-
-        [Alias("v")]
-        [int]$Views = 5,
-
-        [Alias("s")]
-        [string]$Server = "pwpush.com",
-
-        [Alias("k")]
-        [switch]$KillSwitch,
-
-        [Alias("f")]
-        [switch]$FirstView,
-
-        [Alias("w")]
-        [switch]$Wipe,
-
-        [Alias("r")]
-        [int]$Retrieval,
-
-        [Alias("ph")]
-        [string]$Passphrase
+# ------------------------------------------------------------
+# Helper: Open email with PWPush URL
+# ------------------------------------------------------------
+function Open-PWPushEmail {
+    param(
+        [string]$PushUrl,
+        [string]$Recipient = ""
     )
 
-    $payload = ConvertFrom-SecurePassword $Password
-
-    $bodyObject = @{
-        password = @{
-            payload            = $payload
-            expire_after_days  = $Days
-            expire_after_views = $Views
-            retrieval_step     = $Retrieval
-            passphrase         = $Passphrase
-            first_view         = $FirstView.IsPresent.ToString().ToLower()
-        }
+    if ([string]::IsNullOrWhiteSpace($PushUrl) -or $PushUrl -notmatch '^https?://') {
+        [System.Windows.Forms.MessageBox]::Show(
+            "There is no valid PWPush URL to email yet.",
+            "PWPush URL Missing",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        return
     }
 
-    if ($KillSwitch) {
-        $bodyObject.password["deletable_by_viewer"] = $true
-    }
+    $subject = "Your secure PWPush link"
 
-    $Reply = Invoke-RestMethod -Method Post `
-        -Uri "https://$Server/p.json" `
-        -ContentType "application/json" `
-        -Body ($bodyObject | ConvertTo-Json -Depth 5)
+    $body = @"
+Hello,
 
-    if ($Reply.url_token) {
-        if ($Wipe) {
-            $Password.Dispose()
-        }
-        return "https://$Server/p/$($Reply.url_token)"
-    }
-    else {
-        throw "Unable to get URL from service"
-    }
+Here is your secure PWPush link:
+
+$PushUrl
+
+Thanks
+"@
+
+    $mailto = "mailto:{0}?subject={1}&body={2}" -f `
+        [System.Uri]::EscapeDataString($Recipient), `
+        [System.Uri]::EscapeDataString($subject), `
+        [System.Uri]::EscapeDataString($body)
+
+    Start-Process $mailto
 }
 
-function Get-GeneratedPassword {
-    $PasswordLengthText = $txtPasswordLength.Text.Trim()
+# ------------------------------------------------------------
+# Helper: Start push cooldown timer
+# ------------------------------------------------------------
+function Start-PushCooldown {
+    $script:PushTimerRemaining = $script:PushCooldownSeconds
+    $btnPush.Enabled = $false
+    $btnPush.Text = "Push ($script:PushTimerRemaining)"
 
-    if ([string]::IsNullOrWhiteSpace($PasswordLengthText)) {
-        throw "Enter a valid numeric length."
+    if ($script:PushTimer -eq $null) {
+        $script:PushTimer = New-Object System.Windows.Forms.Timer
+        $script:PushTimer.Interval = 1000
+        $script:PushTimer.Add_Tick({
+            $script:PushTimerRemaining--
+
+            if ($script:PushTimerRemaining -le 0) {
+                $script:PushTimer.Stop()
+                $btnPush.Enabled = $true
+                $btnPush.Text = "Push"
+            }
+            else {
+                $btnPush.Text = "Push ($script:PushTimerRemaining)"
+            }
+        })
     }
 
-    $parsedLength = 0
-    if (-not [int]::TryParse($PasswordLengthText, [ref]$parsedLength)) {
-        throw "Password length must be a valid number."
-    }
-
-    if ($parsedLength -lt 1) {
-        throw "Password length must be greater than 0."
-    }
-
-    return (New-RandomPassword `
-        -PasswordLength $parsedLength `
-        -UseLetters $chkLetters.Checked `
-        -UseNumbers $chkNumbers.Checked `
-        -UseUppercase $chkUppercase.Checked `
-        -UseSpecial $chkSpecial.Checked)
+    $script:PushTimer.Start()
 }
 
-function Update-RandomOptionState {
-    $usingCustom = -not [string]::IsNullOrWhiteSpace($txtCustomPassword.Text)
-
-    $txtPasswordLength.Enabled = -not $usingCustom
-    $lblPasswordLength.Enabled = -not $usingCustom
-
-    $chkLetters.Enabled = -not $usingCustom
-    $chkNumbers.Enabled = -not $usingCustom
-    $chkUppercase.Enabled = (-not $usingCustom) -and $chkLetters.Checked
-    $chkSpecial.Enabled = -not $usingCustom
-
-    if (-not $chkLetters.Checked) {
-        $chkUppercase.Checked = $false
-        $chkUppercase.Enabled = $false
-    }
-}
-
-function Reset-PushState {
-    $pwpushTextBox.Clear()
-    $btnPush.Text = "Push"
-    $btnPush.Enabled = $true
-    $timer.Stop()
-}
-
-# -----------------------------
+# ------------------------------------------------------------
 # Form
-# -----------------------------
-
+# ------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "PWPush.com Generator 1.8"
-$form.Width = 500
-$form.Height = 470
-$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedSingle
-$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-$form.MaximizeBox = $false
-$form.TopMost = $true
+$form.Text = "PWPush Password Sender"
+$form.StartPosition = "CenterScreen"
+$form.Size = New-Object System.Drawing.Size(880, 820)
+$form.MinimumSize = New-Object System.Drawing.Size(880, 820)
+$form.BackColor = [System.Drawing.Color]::WhiteSmoke
+$form.Font = New-Object System.Drawing.Font("Segoe UI", 10)
 
-# Passphrase
-$lblpassphrase = New-Object System.Windows.Forms.Label
-$lblpassphrase.Text = "Passphrase:"
-$lblpassphrase.AutoSize = $true
-$lblpassphrase.Location = New-Object System.Drawing.Point(10, 18)
+# ------------------------------------------------------------
+# Title
+# ------------------------------------------------------------
+$lblTitle = New-Object System.Windows.Forms.Label
+$lblTitle.Text = "PWPush Password Sender"
+$lblTitle.Font = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
+$lblTitle.Location = New-Object System.Drawing.Point(20, 15)
+$lblTitle.Size = New-Object System.Drawing.Size(350, 35)
+$form.Controls.Add($lblTitle)
 
-$txtpassphrase = New-Object System.Windows.Forms.TextBox
-$txtpassphrase.Width = 90
-$txtpassphrase.Location = New-Object System.Drawing.Point(85, 15)
+# ------------------------------------------------------------
+# PWPush Base URL
+# ------------------------------------------------------------
+$lblBaseUrl = New-Object System.Windows.Forms.Label
+$lblBaseUrl.Text = "PWPush Base URL:"
+$lblBaseUrl.Location = New-Object System.Drawing.Point(20, 65)
+$lblBaseUrl.Size = New-Object System.Drawing.Size(130, 25)
+$form.Controls.Add($lblBaseUrl)
 
-# Length
-$lblPasswordLength = New-Object System.Windows.Forms.Label
-$lblPasswordLength.Text = "Length:"
-$lblPasswordLength.AutoSize = $true
-$lblPasswordLength.Location = New-Object System.Drawing.Point(180, 18)
+$txtBaseUrl = New-Object System.Windows.Forms.TextBox
+$txtBaseUrl.Location = New-Object System.Drawing.Point(170, 62)
+$txtBaseUrl.Size = New-Object System.Drawing.Size(520, 28)
+$txtBaseUrl.Text = "https://pwpush.mget.ca"
+$txtBaseUrl.TabIndex = 4
+$form.Controls.Add($txtBaseUrl)
 
-$txtPasswordLength = New-Object System.Windows.Forms.TextBox
-$txtPasswordLength.Width = 45
-$txtPasswordLength.Location = New-Object System.Drawing.Point(230, 15)
+# ------------------------------------------------------------
+# Recipient Email
+# ------------------------------------------------------------
+$lblRecipient = New-Object System.Windows.Forms.Label
+$lblRecipient.Text = "Recipient Email:"
+$lblRecipient.Location = New-Object System.Drawing.Point(20, 105)
+$lblRecipient.Size = New-Object System.Drawing.Size(130, 25)
+$form.Controls.Add($lblRecipient)
 
-# 1-click
-$checkBox = New-Object System.Windows.Forms.CheckBox
-$checkBox.Text = "1-Click"
-$checkBox.AutoSize = $true
-$checkBox.Location = New-Object System.Drawing.Point(290, 17)
+$txtRecipient = New-Object System.Windows.Forms.TextBox
+$txtRecipient.Location = New-Object System.Drawing.Point(170, 102)
+$txtRecipient.Size = New-Object System.Drawing.Size(300, 28)
+$txtRecipient.TabIndex = 0
+$form.Controls.Add($txtRecipient)
 
-# Custom Password
-$lblCustomPassword = New-Object System.Windows.Forms.Label
-$lblCustomPassword.Text = "Custom Password:"
-$lblCustomPassword.AutoSize = $true
-$lblCustomPassword.Location = New-Object System.Drawing.Point(10, 50)
+# ------------------------------------------------------------
+# Password
+# ------------------------------------------------------------
+$lblPassword = New-Object System.Windows.Forms.Label
+$lblPassword.Text = "Custom Password:"
+$lblPassword.Location = New-Object System.Drawing.Point(20, 145)
+$lblPassword.Size = New-Object System.Drawing.Size(130, 25)
+$form.Controls.Add($lblPassword)
 
-$txtCustomPassword = New-Object System.Windows.Forms.TextBox
-$txtCustomPassword.Width = 250
-$txtCustomPassword.Location = New-Object System.Drawing.Point(135, 47)
-$txtCustomPassword.UseSystemPasswordChar = $true
+$txtPassword = New-Object System.Windows.Forms.TextBox
+$txtPassword.Location = New-Object System.Drawing.Point(170, 142)
+$txtPassword.Size = New-Object System.Drawing.Size(430, 28)
+$txtPassword.UseSystemPasswordChar = $false
+$txtPassword.TabIndex = 1
+$form.Controls.Add($txtPassword)
 
-# Show/hide custom
-$chkShowCustom = New-Object System.Windows.Forms.CheckBox
-$chkShowCustom.Text = "Show"
-$chkShowCustom.AutoSize = $true
-$chkShowCustom.Location = New-Object System.Drawing.Point(395, 49)
-$chkShowCustom.Add_CheckedChanged({
-    $txtCustomPassword.UseSystemPasswordChar = -not $chkShowCustom.Checked
+$btnClearPassword = New-Object System.Windows.Forms.Button
+$btnClearPassword.Text = "Clear"
+$btnClearPassword.Location = New-Object System.Drawing.Point(610, 140)
+$btnClearPassword.Size = New-Object System.Drawing.Size(80, 30)
+$btnClearPassword.Add_Click({
+    $txtPassword.Text = ""
+    Set-Status -Message "Password cleared." -Color ([System.Drawing.Color]::DarkOrange)
+    Write-Log "Password box cleared."
 })
+$form.Controls.Add($btnClearPassword)
 
-# Random options label
-$lblRandomOptions = New-Object System.Windows.Forms.Label
-$lblRandomOptions.Text = "Random Password Options:"
-$lblRandomOptions.AutoSize = $true
-$lblRandomOptions.Location = New-Object System.Drawing.Point(10, 82)
+# ------------------------------------------------------------
+# Additional Information
+# ------------------------------------------------------------
+$lblAdditionalInfo = New-Object System.Windows.Forms.Label
+$lblAdditionalInfo.Text = "Additional Information:"
+$lblAdditionalInfo.Location = New-Object System.Drawing.Point(20, 185)
+$lblAdditionalInfo.Size = New-Object System.Drawing.Size(140, 25)
+$form.Controls.Add($lblAdditionalInfo)
 
-# Random option checkboxes
+$txtAdditionalInfo = New-Object System.Windows.Forms.TextBox
+$txtAdditionalInfo.Location = New-Object System.Drawing.Point(170, 182)
+$txtAdditionalInfo.Size = New-Object System.Drawing.Size(520, 95)
+$txtAdditionalInfo.Multiline = $true
+$txtAdditionalInfo.ScrollBars = "Vertical"
+$txtAdditionalInfo.AcceptsReturn = $true
+$txtAdditionalInfo.AcceptsTab = $false
+$form.Controls.Add($txtAdditionalInfo)
+
+# ------------------------------------------------------------
+# Password generation options
+# ------------------------------------------------------------
+$grpGenerate = New-Object System.Windows.Forms.GroupBox
+$grpGenerate.Text = "Password Generation Options"
+$grpGenerate.Location = New-Object System.Drawing.Point(20, 290)
+$grpGenerate.Size = New-Object System.Drawing.Size(820, 110)
+$form.Controls.Add($grpGenerate)
+
 $chkLetters = New-Object System.Windows.Forms.CheckBox
-$chkLetters.Text = "Letters"
-$chkLetters.AutoSize = $true
-$chkLetters.Location = New-Object System.Drawing.Point(25, 105)
+$chkLetters.Text = "Letters (lowercase)"
+$chkLetters.Location = New-Object System.Drawing.Point(20, 30)
+$chkLetters.Size = New-Object System.Drawing.Size(150, 25)
 $chkLetters.Checked = $true
-
-$chkNumbers = New-Object System.Windows.Forms.CheckBox
-$chkNumbers.Text = "Numbers"
-$chkNumbers.AutoSize = $true
-$chkNumbers.Location = New-Object System.Drawing.Point(115, 105)
-$chkNumbers.Checked = $true
+$grpGenerate.Controls.Add($chkLetters)
 
 $chkUppercase = New-Object System.Windows.Forms.CheckBox
 $chkUppercase.Text = "Uppercase"
-$chkUppercase.AutoSize = $true
-$chkUppercase.Location = New-Object System.Drawing.Point(220, 105)
+$chkUppercase.Location = New-Object System.Drawing.Point(190, 30)
+$chkUppercase.Size = New-Object System.Drawing.Size(120, 25)
 $chkUppercase.Checked = $true
+$grpGenerate.Controls.Add($chkUppercase)
+
+$chkNumbers = New-Object System.Windows.Forms.CheckBox
+$chkNumbers.Text = "Numbers"
+$chkNumbers.Location = New-Object System.Drawing.Point(320, 30)
+$chkNumbers.Size = New-Object System.Drawing.Size(100, 25)
+$chkNumbers.Checked = $true
+$grpGenerate.Controls.Add($chkNumbers)
 
 $chkSpecial = New-Object System.Windows.Forms.CheckBox
 $chkSpecial.Text = "Special Characters"
-$chkSpecial.AutoSize = $true
-$chkSpecial.Location = New-Object System.Drawing.Point(335, 105)
+$chkSpecial.Location = New-Object System.Drawing.Point(430, 30)
+$chkSpecial.Size = New-Object System.Drawing.Size(160, 25)
 $chkSpecial.Checked = $true
+$grpGenerate.Controls.Add($chkSpecial)
 
-# Disable Length and random options when custom password is entered
-$txtCustomPassword.Add_TextChanged({
-    Update-RandomOptionState
-    Reset-PushState
-})
+$lblLength = New-Object System.Windows.Forms.Label
+$lblLength.Text = "Password Length:"
+$lblLength.Location = New-Object System.Drawing.Point(20, 67)
+$lblLength.Size = New-Object System.Drawing.Size(130, 25)
+$grpGenerate.Controls.Add($lblLength)
 
-$chkLetters.Add_CheckedChanged({
-    Update-RandomOptionState
-    Reset-PushState
-})
+$numLength = New-Object System.Windows.Forms.NumericUpDown
+$numLength.Location = New-Object System.Drawing.Point(160, 64)
+$numLength.Size = New-Object System.Drawing.Size(80, 28)
+$numLength.Minimum = 4
+$numLength.Maximum = 128
+$numLength.Value = 20
+$grpGenerate.Controls.Add($numLength)
 
-$chkNumbers.Add_CheckedChanged({
-    Reset-PushState
-})
-
-$chkUppercase.Add_CheckedChanged({
-    Reset-PushState
-})
-
-$chkSpecial.Add_CheckedChanged({
-    Reset-PushState
-})
-
-$txtPasswordLength.Add_TextChanged({
-    Reset-PushState
-})
-
-$txtpassphrase.Add_TextChanged({
-    Reset-PushState
-})
-
-$checkBox.Add_CheckedChanged({
-    Reset-PushState
-})
-
-# Enter key support
-$txtPasswordLength.Add_KeyDown({
-    if ($_.KeyCode -eq 'Enter') {
-        $btnGenerate.PerformClick()
-    }
-})
-
-$txtCustomPassword.Add_KeyDown({
-    if ($_.KeyCode -eq 'Enter') {
-        if (-not [string]::IsNullOrWhiteSpace($txtCustomPassword.Text)) {
-            $btnPush.PerformClick()
-        }
-        else {
-            $btnGenerate.PerformClick()
-        }
-    }
-})
-
-# Days
-$lblDays = New-Object System.Windows.Forms.Label
-$lblDays.Text = "Days: 7"
-$lblDays.Location = New-Object System.Drawing.Point(30, 145)
-$lblDays.Width = 80
-
-$sliderDays = New-Object System.Windows.Forms.TrackBar
-$sliderDays.Minimum = 0
-$sliderDays.Maximum = 14
-$sliderDays.Value = 7
-$sliderDays.Location = New-Object System.Drawing.Point(100, 135)
-$sliderDays.Width = 360
-$sliderDays.TickFrequency = 1
-$sliderDays.Add_ValueChanged({
-    $lblDays.Text = "Days: " + $sliderDays.Value
-    Reset-PushState
-})
-
-# Views
-$lblViews = New-Object System.Windows.Forms.Label
-$lblViews.Text = "Views: 5"
-$lblViews.Location = New-Object System.Drawing.Point(30, 185)
-$lblViews.Width = 80
-
-$sliderViews = New-Object System.Windows.Forms.TrackBar
-$sliderViews.Minimum = 0
-$sliderViews.Maximum = 10
-$sliderViews.Value = 5
-$sliderViews.Location = New-Object System.Drawing.Point(100, 175)
-$sliderViews.Width = 360
-$sliderViews.TickFrequency = 1
-$sliderViews.Add_ValueChanged({
-    $lblViews.Text = "Views: " + $sliderViews.Value
-    Reset-PushState
-})
-
-# Generate button
 $btnGenerate = New-Object System.Windows.Forms.Button
 $btnGenerate.Text = "Generate"
-$btnGenerate.Width = 120
-$btnGenerate.Height = 36
-$btnGenerate.Location = New-Object System.Drawing.Point(120, 220)
-
-# Push button
-$btnPush = New-Object System.Windows.Forms.Button
-$btnPush.Text = "Push"
-$btnPush.Width = 120
-$btnPush.Height = 36
-$btnPush.Location = New-Object System.Drawing.Point(255, 220)
-
-# Output textbox
-$outputTextBox = New-Object System.Windows.Forms.TextBox
-$outputTextBox.Multiline = $true
-$outputTextBox.Width = 450
-$outputTextBox.Height = 49
-$outputTextBox.Location = New-Object System.Drawing.Point(10, 270)
-$outputTextBox.ReadOnly = $true
-$outputTextBox.TabStop = $false
-$outputTextBox.BackColor = [System.Drawing.Color]::White
-
-# PWPush label
-$PWPushnotif = New-Object System.Windows.Forms.Label
-$PWPushnotif.Text = "PWPush URL:"
-$PWPushnotif.AutoSize = $true
-$PWPushnotif.Location = New-Object System.Drawing.Point(10, 327)
-
-# PWPush URL textbox
-$pwpushTextBox = New-Object System.Windows.Forms.TextBox
-$pwpushTextBox.Multiline = $true
-$pwpushTextBox.Width = 450
-$pwpushTextBox.Height = 20
-$pwpushTextBox.Location = New-Object System.Drawing.Point(10, 345)
-$pwpushTextBox.ReadOnly = $true
-$pwpushTextBox.TabStop = $false
-$pwpushTextBox.BackColor = [System.Drawing.Color]::White
-
-# Clipboard buttons
-$passClip = New-Object System.Windows.Forms.Button
-$passClip.Text = "Password to Clipboard"
-$passClip.Width = 140
-$passClip.Height = 36
-$passClip.Location = New-Object System.Drawing.Point(85, 375)
-$passClip.Add_Click({
-    if ($outputTextBox.Text) {
-        Set-Clipboard -Value $outputTextBox.Text
-    }
-})
-
-$pwpushClip = New-Object System.Windows.Forms.Button
-$pwpushClip.Text = "PWPush URL to Clipboard"
-$pwpushClip.Width = 160
-$pwpushClip.Height = 36
-$pwpushClip.Location = New-Object System.Drawing.Point(255, 375)
-$pwpushClip.Add_Click({
-    if ($pwpushTextBox.Text) {
-        Set-Clipboard -Value $pwpushTextBox.Text
-    }
-})
-
-# Timer for Push button only
-$timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 1000
-$timer.Add_Tick({
-    $countdown = [int]($btnPush.Text.Split(' ')[-1]) - 1
-    $btnPush.Text = "Push reset in: $countdown"
-
-    if ($countdown -le 0) {
-        $pwpushTextBox.Clear()
-        $btnPush.Text = "Push"
-        $btnPush.Enabled = $true
-        $timer.Stop()
-    }
-})
-
-# Generate action
+$btnGenerate.Location = New-Object System.Drawing.Point(270, 61)
+$btnGenerate.Size = New-Object System.Drawing.Size(110, 32)
+$btnGenerate.TabIndex = 2
 $btnGenerate.Add_Click({
     try {
-        Reset-PushState
+        $generatedPassword = Generate-RandomPassword `
+            -Length ([int]$numLength.Value) `
+            -UseLetters $chkLetters.Checked `
+            -UseNumbers $chkNumbers.Checked `
+            -UseUppercase $chkUppercase.Checked `
+            -UseSpecial $chkSpecial.Checked
 
-        if (-not [string]::IsNullOrWhiteSpace($txtCustomPassword.Text)) {
-            $outputTextBox.Text = $txtCustomPassword.Text
-        }
-        else {
-            $outputTextBox.Text = Get-GeneratedPassword
-        }
+        $txtPassword.Text = $generatedPassword
+        Set-Status -Message "Password generated." -Color ([System.Drawing.Color]::ForestGreen)
+        Write-Log "Password generated successfully."
     }
     catch {
-        $outputTextBox.Text = $_.Exception.Message
-        $pwpushTextBox.Clear()
+        Set-Status -Message $_.Exception.Message -Color ([System.Drawing.Color]::Firebrick)
+        Write-Log "Generate failed: $($_.Exception.Message)"
     }
 })
+$grpGenerate.Controls.Add($btnGenerate)
 
-# Push action
+# ------------------------------------------------------------
+# Expiry controls
+# ------------------------------------------------------------
+$grpExpiry = New-Object System.Windows.Forms.GroupBox
+$grpExpiry.Text = "PWPush Expiry Settings"
+$grpExpiry.Location = New-Object System.Drawing.Point(20, 415)
+$grpExpiry.Size = New-Object System.Drawing.Size(820, 80)
+$form.Controls.Add($grpExpiry)
+
+$lblDays = New-Object System.Windows.Forms.Label
+$lblDays.Text = "Days (max 14):"
+$lblDays.Location = New-Object System.Drawing.Point(20, 33)
+$lblDays.Size = New-Object System.Drawing.Size(120, 25)
+$grpExpiry.Controls.Add($lblDays)
+
+$numDays = New-Object System.Windows.Forms.NumericUpDown
+$numDays.Location = New-Object System.Drawing.Point(140, 30)
+$numDays.Size = New-Object System.Drawing.Size(80, 28)
+$numDays.Minimum = 1
+$numDays.Maximum = 14
+$numDays.Value = 7
+$grpExpiry.Controls.Add($numDays)
+
+$lblViews = New-Object System.Windows.Forms.Label
+$lblViews.Text = "Views (max 10):"
+$lblViews.Location = New-Object System.Drawing.Point(260, 33)
+$lblViews.Size = New-Object System.Drawing.Size(120, 25)
+$grpExpiry.Controls.Add($lblViews)
+
+$numViews = New-Object System.Windows.Forms.NumericUpDown
+$numViews.Location = New-Object System.Drawing.Point(380, 30)
+$numViews.Size = New-Object System.Drawing.Size(80, 28)
+$numViews.Minimum = 1
+$numViews.Maximum = 10
+$numViews.Value = 5
+$grpExpiry.Controls.Add($numViews)
+
+# ------------------------------------------------------------
+# PWPush URL result
+# ------------------------------------------------------------
+$lblPushUrl = New-Object System.Windows.Forms.Label
+$lblPushUrl.Text = "PWPush URL:"
+$lblPushUrl.Location = New-Object System.Drawing.Point(20, 515)
+$lblPushUrl.Size = New-Object System.Drawing.Size(130, 25)
+$form.Controls.Add($lblPushUrl)
+
+$txtPushUrl = New-Object System.Windows.Forms.TextBox
+$txtPushUrl.Location = New-Object System.Drawing.Point(170, 512)
+$txtPushUrl.Size = New-Object System.Drawing.Size(520, 28)
+$txtPushUrl.ReadOnly = $true
+$form.Controls.Add($txtPushUrl)
+
+$btnCopyUrl = New-Object System.Windows.Forms.Button
+$btnCopyUrl.Text = "Copy URL"
+$btnCopyUrl.Location = New-Object System.Drawing.Point(700, 510)
+$btnCopyUrl.Size = New-Object System.Drawing.Size(100, 30)
+$btnCopyUrl.Enabled = $false
+$btnCopyUrl.Add_Click({
+    if (-not [string]::IsNullOrWhiteSpace($txtPushUrl.Text)) {
+        [System.Windows.Forms.Clipboard]::SetText($txtPushUrl.Text)
+        Set-Status -Message "PWPush URL copied to clipboard." -Color ([System.Drawing.Color]::ForestGreen)
+        Write-Log "PWPush URL copied to clipboard."
+    }
+})
+$form.Controls.Add($btnCopyUrl)
+
+# ------------------------------------------------------------
+# Buttons
+# ------------------------------------------------------------
+$btnPush = New-Object System.Windows.Forms.Button
+$btnPush.Text = "Push"
+$btnPush.Location = New-Object System.Drawing.Point(20, 560)
+$btnPush.Size = New-Object System.Drawing.Size(120, 40)
+$btnPush.TabIndex = 3
 $btnPush.Add_Click({
     try {
-        $timer.Stop()
-        $pwpushTextBox.Clear()
+        $passwordText = $txtPassword.Text.Trim()
 
-        # Always prefer the Custom Password box if it has text
-        if (-not [string]::IsNullOrWhiteSpace($txtCustomPassword.Text)) {
-            $PlainPassword = $txtCustomPassword.Text
-            $outputTextBox.Text = $PlainPassword
-        }
-        else {
-            $PlainPassword = $outputTextBox.Text
-        }
-
-        if ([string]::IsNullOrWhiteSpace($PlainPassword)) {
+        if ([string]::IsNullOrWhiteSpace($passwordText)) {
             throw "Generate or enter a password first before pushing."
         }
 
-        $Days = $sliderDays.Value
-        $Views = $sliderViews.Value
-        $Passphrase = $txtpassphrase.Text.Trim()
-        $OneClickSuffix = if ($checkBox.Checked) { "/r" } else { "" }
+        $payloadText = "Password: $passwordText"
 
-        Write-Host "PW being pushed: [$PlainPassword]"
-
-        $SecurePassword = ConvertTo-SecureString -String $PlainPassword -AsPlainText -Force
-
-        if ([string]::IsNullOrWhiteSpace($Passphrase)) {
-            $PWPUSH = Publish-Password -Password $SecurePassword -Days $Days -Views $Views
-        }
-        else {
-            $PWPUSH = Publish-Password -Password $SecurePassword -Days $Days -Views $Views -Passphrase $Passphrase
+        if (-not [string]::IsNullOrWhiteSpace($txtAdditionalInfo.Text)) {
+            $extraText = $txtAdditionalInfo.Text.Trim()
+            $payloadText += "`r`n$extraText"
         }
 
-        if ([string]::IsNullOrWhiteSpace($PWPUSH)) {
-            throw "PWPush did not return a URL."
-        }
+        Set-Status -Message "Pushing password to PWPush..." -Color ([System.Drawing.Color]::DodgerBlue)
+        Write-Log "Push requested."
 
-        if ($checkBox.Checked) {
-            $pwpushTextBox.Text = $PWPUSH + $OneClickSuffix
-        }
-        else {
-            $pwpushTextBox.Text = $PWPUSH
-        }
+        $pushUrl = Push-PWPush `
+            -BaseUrl $txtBaseUrl.Text.Trim() `
+            -Password $payloadText `
+            -ExpireDays ([int]$numDays.Value) `
+            -ExpireViews ([int]$numViews.Value)
 
-        $btnPush.Text = "Push reset in: 30"
-        $btnPush.Enabled = $false
-        $timer.Start()
+        $script:LastPushUrl = $pushUrl
+        $txtPushUrl.Text = $pushUrl
+        $btnCopyUrl.Enabled = $true
+        $btnEmailUrl.Enabled = $true
+
+        Set-Status -Message "Password pushed successfully." -Color ([System.Drawing.Color]::ForestGreen)
+        Write-Log "Push successful. URL: $pushUrl"
+
+        Start-PushCooldown
     }
     catch {
-        $pwpushTextBox.Clear()
-        $outputTextBox.Text = $_.Exception.Message
+        Set-Status -Message "Push failed: $($_.Exception.Message)" -Color ([System.Drawing.Color]::Firebrick)
+        Write-Log "Push failed: $($_.Exception.Message)"
     }
 })
-
-# Add controls
-$form.Controls.Add($lblpassphrase)
-$form.Controls.Add($txtpassphrase)
-$form.Controls.Add($lblPasswordLength)
-$form.Controls.Add($txtPasswordLength)
-$form.Controls.Add($checkBox)
-$form.Controls.Add($lblCustomPassword)
-$form.Controls.Add($txtCustomPassword)
-$form.Controls.Add($chkShowCustom)
-$form.Controls.Add($lblRandomOptions)
-$form.Controls.Add($chkLetters)
-$form.Controls.Add($chkNumbers)
-$form.Controls.Add($chkUppercase)
-$form.Controls.Add($chkSpecial)
-$form.Controls.Add($lblDays)
-$form.Controls.Add($sliderDays)
-$form.Controls.Add($lblViews)
-$form.Controls.Add($sliderViews)
-$form.Controls.Add($btnGenerate)
 $form.Controls.Add($btnPush)
-$form.Controls.Add($outputTextBox)
-$form.Controls.Add($PWPushnotif)
-$form.Controls.Add($pwpushTextBox)
-$form.Controls.Add($passClip)
-$form.Controls.Add($pwpushClip)
 
-# Initialize control state
-Update-RandomOptionState
+$btnEmailUrl = New-Object System.Windows.Forms.Button
+$btnEmailUrl.Text = "Email PWPush URL"
+$btnEmailUrl.Location = New-Object System.Drawing.Point(155, 560)
+$btnEmailUrl.Size = New-Object System.Drawing.Size(150, 40)
+$btnEmailUrl.Enabled = $false
+$btnEmailUrl.Add_Click({
+    Open-PWPushEmail -PushUrl $txtPushUrl.Text.Trim() -Recipient $txtRecipient.Text.Trim()
+    Set-Status -Message "Opened default mail client." -Color ([System.Drawing.Color]::ForestGreen)
+    Write-Log "Opened mail client for PWPush URL email."
+})
+$form.Controls.Add($btnEmailUrl)
 
-# Show form
-$form.Add_Shown({ $form.Activate() })
-$form.Add_FormClosed({
-    $timer.Dispose()
+$btnOpenUrl = New-Object System.Windows.Forms.Button
+$btnOpenUrl.Text = "Open URL"
+$btnOpenUrl.Location = New-Object System.Drawing.Point(320, 560)
+$btnOpenUrl.Size = New-Object System.Drawing.Size(110, 40)
+$btnOpenUrl.Add_Click({
+    if (-not [string]::IsNullOrWhiteSpace($txtPushUrl.Text)) {
+        Start-Process $txtPushUrl.Text
+        Set-Status -Message "Opened PWPush URL in browser." -Color ([System.Drawing.Color]::ForestGreen)
+        Write-Log "Opened PWPush URL in browser."
+    }
+    else {
+        Set-Status -Message "No PWPush URL available to open." -Color ([System.Drawing.Color]::DarkOrange)
+        Write-Log "Open URL requested with no PWPush URL available."
+    }
+})
+$form.Controls.Add($btnOpenUrl)
+
+$btnReset = New-Object System.Windows.Forms.Button
+$btnReset.Text = "Reset"
+$btnReset.Location = New-Object System.Drawing.Point(445, 560)
+$btnReset.Size = New-Object System.Drawing.Size(110, 40)
+$btnReset.Add_Click({
+    $txtRecipient.Text = ""
+    $txtPassword.Text = ""
+    $txtAdditionalInfo.Text = ""
+    $txtPushUrl.Text = ""
+    $script:LastPushUrl = ""
+    $btnCopyUrl.Enabled = $false
+    $btnEmailUrl.Enabled = $false
+    $numDays.Value = 7
+    $numViews.Value = 5
+    $numLength.Value = 20
+    $chkLetters.Checked = $true
+    $chkUppercase.Checked = $true
+    $chkNumbers.Checked = $true
+    $chkSpecial.Checked = $true
+    Set-Status -Message "Form reset." -Color ([System.Drawing.Color]::DodgerBlue)
+    Write-Log "Form reset."
+    $txtRecipient.Focus()
+    $txtRecipient.Select()
+})
+$form.Controls.Add($btnReset)
+
+$btnClose = New-Object System.Windows.Forms.Button
+$btnClose.Text = "Close"
+$btnClose.Location = New-Object System.Drawing.Point(570, 560)
+$btnClose.Size = New-Object System.Drawing.Size(110, 40)
+$btnClose.Add_Click({
+    $form.Close()
+})
+$form.Controls.Add($btnClose)
+
+# ------------------------------------------------------------
+# Status
+# ------------------------------------------------------------
+$lblStatusHeader = New-Object System.Windows.Forms.Label
+$lblStatusHeader.Text = "Status:"
+$lblStatusHeader.Location = New-Object System.Drawing.Point(20, 620)
+$lblStatusHeader.Size = New-Object System.Drawing.Size(60, 25)
+$form.Controls.Add($lblStatusHeader)
+
+$lblStatus = New-Object System.Windows.Forms.Label
+$lblStatus.Text = "Ready."
+$lblStatus.Location = New-Object System.Drawing.Point(85, 620)
+$lblStatus.Size = New-Object System.Drawing.Size(750, 25)
+$lblStatus.ForeColor = [System.Drawing.Color]::Black
+$form.Controls.Add($lblStatus)
+
+# ------------------------------------------------------------
+# Log Output
+# ------------------------------------------------------------
+$lblLog = New-Object System.Windows.Forms.Label
+$lblLog.Text = "Activity Log:"
+$lblLog.Location = New-Object System.Drawing.Point(20, 650)
+$lblLog.Size = New-Object System.Drawing.Size(100, 25)
+$form.Controls.Add($lblLog)
+
+$txtLog = New-Object System.Windows.Forms.TextBox
+$txtLog.Location = New-Object System.Drawing.Point(20, 675)
+$txtLog.Size = New-Object System.Drawing.Size(820, 90)
+$txtLog.Multiline = $true
+$txtLog.ScrollBars = "Vertical"
+$txtLog.ReadOnly = $true
+$form.Controls.Add($txtLog)
+
+# ------------------------------------------------------------
+# Startup log
+# ------------------------------------------------------------
+Write-Log "PWPush GUI started."
+Set-Status -Message "Ready." -Color ([System.Drawing.Color]::Black)
+
+# ------------------------------------------------------------
+# Set initial focus
+# ------------------------------------------------------------
+$form.Add_Shown({
+    $form.Activate()
+    $txtRecipient.Focus()
+    $txtRecipient.Select()
 })
 
+# ------------------------------------------------------------
+# Show form
+# ------------------------------------------------------------
 [void]$form.ShowDialog()
