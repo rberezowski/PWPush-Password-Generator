@@ -11,7 +11,7 @@ Add-Type -AssemblyName System.Drawing
 #           and optionally open a new email with the PWPush URL.
 #
 # Notes:
-# - Default PWPush URL = https://pwpush.mget.ca
+# - Default PWPush URL = https://pwpush..com
 # - Startup cursor lands in Recipient Email
 # - Max Days  = 14
 # - Max Views = 10
@@ -331,7 +331,7 @@ $form.Controls.Add($lblBaseUrl)
 $txtBaseUrl = New-Object System.Windows.Forms.TextBox
 $txtBaseUrl.Location = New-Object System.Drawing.Point(170, 62)
 $txtBaseUrl.Size = New-Object System.Drawing.Size(520, 28)
-$txtBaseUrl.Text = "https://pwpush.mget.ca"
+$txtBaseUrl.Text = "https://pwpush.com"
 $txtBaseUrl.TabIndex = 4
 $form.Controls.Add($txtBaseUrl)
 
